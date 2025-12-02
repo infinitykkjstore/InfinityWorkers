@@ -14,6 +14,7 @@ o PID indicado estiver vivo.
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 import socket
 import sys
 import signal
@@ -217,15 +218,46 @@ def start_flask_server():
 	return True
 
 
-def announce(url, ip, ssh_link=None, timeout=10):
+def announce(url, ip, ssh_link=None, timeout=10, retries=3):
 	params = {'ip': ip}
 	if ssh_link:
 		params['ssh'] = ssh_link
 	qs = urllib.parse.urlencode(params)
 	full = f"{url}?{qs}"
-	req = urllib.request.Request(full, headers={'User-Agent': 'infinitykkjserver/1.9.5'})
-	with urllib.request.urlopen(req, timeout=timeout) as resp:
-		return resp.read().decode('utf-8', errors='replace')
+	headers = {'User-Agent': 'infinitykkjserver/1.9.5'}
+
+	backoff = 1
+	for attempt in range(1, retries + 1):
+		try:
+			req = urllib.request.Request(full, headers=headers)
+			with urllib.request.urlopen(req, timeout=timeout) as resp:
+				content = resp.read().decode('utf-8', errors='replace')
+				return True, content
+
+		except urllib.error.HTTPError as e:
+			# retry on server errors (5xx), otherwise fail fast
+			if 500 <= getattr(e, 'code', 0) < 600 and attempt < retries:
+				time.sleep(backoff)
+				backoff *= 2
+				continue
+			return False, f'HTTPError {getattr(e, "code", "?")}: {e.reason}'
+
+		except urllib.error.URLError as e:
+			# network-related errors: retry
+			if attempt < retries:
+				time.sleep(backoff)
+				backoff *= 2
+				continue
+			return False, f'URLError: {e}'
+
+		except Exception as e:
+			if attempt < retries:
+				time.sleep(backoff)
+				backoff *= 2
+				continue
+			return False, f'Error: {e}'
+
+	return False, 'max_retries_exceeded'
 
 
 def main():
@@ -250,21 +282,29 @@ def main():
 		print('Erro ao iniciar servidor Flask:', e)
 
 	while True:
-		ip = get_host_ip()
-		now = time.strftime('%Y-%m-%d %H:%M:%S')
-
-		# garantir sshx e obter link (se possível)
-		ssh_link = None
 		try:
-			ssh_link = ensure_sshx()
-		except Exception as e:
-			print(f"[{now}] erro ao garantir sshx: {e}")
+			ip = get_host_ip()
+			now = time.strftime('%Y-%m-%d %H:%M:%S')
 
-		try:
-			resp = announce(url, ip, ssh_link)
-			print(f"[{now}] enviado ip={ip} ssh={ssh_link} -> OK; resposta curta: {resp[:200]}")
+			# garantir sshx e obter link (se possível)
+			ssh_link = None
+			try:
+				ssh_link = ensure_sshx()
+			except Exception as e:
+				print(f"[{now}] erro ao garantir sshx: {e}")
+
+			ok, resp = announce(url, ip, ssh_link)
+			if ok:
+				print(f"[{now}] enviado ip={ip} ssh={ssh_link} -> OK; resposta curta: {resp[:200]}")
+			else:
+				# log e continuar (não encerrar)
+				print(f"[{now}] announce falhou para ip={ip} ssh={ssh_link}: {resp}")
+
+		except KeyboardInterrupt:
+			raise
 		except Exception as e:
-			print(f"[{now}] erro ao enviar ip={ip} ssh={ssh_link}: {e}")
+			# proteger loop contra qualquer exceção inesperada
+			print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Erro inesperado no loop: {e}")
 
 		# Espera 60 segundos antes do próximo envio
 		time.sleep(60)
