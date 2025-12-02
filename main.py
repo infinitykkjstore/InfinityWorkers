@@ -24,6 +24,7 @@ import json
 import tempfile
 import re
 import shlex
+import threading
 
 
 def _clean_ansi_and_control(s: str) -> str:
@@ -40,6 +41,7 @@ def _clean_ansi_and_control(s: str) -> str:
 
 STATE_FILE = os.path.join(tempfile.gettempdir(), 'sshx_announcer_state.json')
 SSHX_LOG = os.path.join(tempfile.gettempdir(), 'sshx_announce.log')
+FLASK_STARTED = False
 
 
 def get_host_ip():
@@ -174,6 +176,47 @@ def ensure_sshx():
 	return link
 
 
+def start_flask_server():
+	global FLASK_STARTED
+	if FLASK_STARTED:
+		return True
+
+	# tentar importar Flask; se não existir, instalar via pip usando o mesmo
+	# interpretador que está rodando este script
+	try:
+		from flask import Flask, jsonify
+	except Exception:
+		print('Flask não encontrado; tentando instalar via pip...')
+		try:
+			subprocess.run([sys.executable, '-m', 'pip', 'install', 'flask'], check=True)
+		except Exception as e:
+			print('Falha ao instalar Flask via pip:', e)
+			return False
+
+		# tentar importar novamente
+		try:
+			from flask import Flask, jsonify
+		except Exception as e:
+			print('Ainda não foi possível importar Flask após instalação:', e)
+			return False
+
+	app = Flask('announcer_api')
+
+	@app.route('/ping', methods=['GET'])
+	def ping():
+		return jsonify({'hello': 'hello'})
+
+	def run_app():
+		# roda o flask no thread separado
+		app.run(host='0.0.0.0', port=8081, threaded=True)
+
+	t = threading.Thread(target=run_app, daemon=True)
+	t.start()
+	FLASK_STARTED = True
+	print('Flask server iniciado na porta 8081')
+	return True
+
+
 def announce(url, ip, ssh_link=None, timeout=10):
 	params = {'ip': ip}
 	if ssh_link:
@@ -197,6 +240,14 @@ def main():
 
 	signal.signal(signal.SIGINT, _shutdown)
 	signal.signal(signal.SIGTERM, _shutdown)
+
+	# Iniciar servidor Flask uma vez, antes do primeiro announce
+	try:
+		ok = start_flask_server()
+		if not ok:
+			print('Aviso: falha ao iniciar servidor Flask na porta 8081')
+	except Exception as e:
+		print('Erro ao iniciar servidor Flask:', e)
 
 	while True:
 		ip = get_host_ip()
